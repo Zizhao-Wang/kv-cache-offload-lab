@@ -1,0 +1,15 @@
+name: smoke_test
+description: minimal validation for environment and model loading
+machine_profile: cluster_a100_comput10
+model: qwen2.5-7b-instruct
+runtime: vllm061
+tensor_parallel_size: 1
+gpu_memory_utilization: 0.85
+max_num_seqs: 4
+max_model_len: 2048
+enable_prefix_caching: false
+kv_offload:
+  enabled: false
+prompt:
+  text: "Write one sentence to confirm the server is working."
+  max_tokens: 64

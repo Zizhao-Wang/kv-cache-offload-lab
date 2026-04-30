@@ -1,0 +1,8 @@
+name: template-model
+family: unknown
+model_path: /path/to/model
+tokenizer_path: /path/to/tokenizer
+dtype: bfloat16
+trust_remote_code: false
+max_model_len: 8192
+notes: replace fields for each concrete model

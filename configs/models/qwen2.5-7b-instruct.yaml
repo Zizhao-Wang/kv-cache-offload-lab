@@ -1,0 +1,8 @@
+name: qwen2.5-7b-instruct
+family: qwen2.5
+model_path: /ssdcache/zizhaowang/vllm_lab/models/Qwen2.5-7B-Instruct
+tokenizer_path: /ssdcache/zizhaowang/vllm_lab/models/Qwen2.5-7B-Instruct
+dtype: bfloat16
+trust_remote_code: false
+max_model_len: 32768
+notes: baseline 7b instruct model

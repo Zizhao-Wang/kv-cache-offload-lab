@@ -1,0 +1,8 @@
+name: qwen2.5-14b-instruct
+family: qwen2.5
+model_path: /ssdcache/zizhaowang/vllm_lab/models/Qwen2.5-14B-Instruct
+tokenizer_path: /ssdcache/zizhaowang/vllm_lab/models/Qwen2.5-14B-Instruct
+dtype: bfloat16
+trust_remote_code: false
+max_model_len: 32768
+notes: larger baseline for offload experiments

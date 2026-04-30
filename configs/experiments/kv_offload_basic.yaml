@@ -1,0 +1,18 @@
+name: kv_offload_basic
+description: baseline KV offload experiment on A100
+machine_profile: cluster_a100_comput10
+model: qwen2.5-7b-instruct
+runtime: vllm061
+tensor_parallel_size: 1
+gpu_memory_utilization: 0.9
+max_num_seqs: 8
+max_model_len: 8192
+enable_prefix_caching: true
+kv_offload:
+  enabled: true
+  backend: disk
+  offload_root: /ssdcache/zizhaowang/vllm_lab/kv_cache_offload
+  block_size: 16
+prompt:
+  text: "Summarize the purpose of KV cache offloading in two bullet points."
+  max_tokens: 128

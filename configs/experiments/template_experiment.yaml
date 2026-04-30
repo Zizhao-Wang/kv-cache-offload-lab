@@ -1,0 +1,18 @@
+name: template_experiment
+description: fill in experiment intent
+machine_profile: local_4090
+model: template-model
+runtime: vllm061
+tensor_parallel_size: 1
+gpu_memory_utilization: 0.85
+max_num_seqs: 4
+max_model_len: 4096
+enable_prefix_caching: false
+kv_offload:
+  enabled: false
+  backend: disk
+  offload_root: /path/to/offload
+  block_size: 16
+prompt:
+  text: "Replace with your prompt."
+  max_tokens: 128
