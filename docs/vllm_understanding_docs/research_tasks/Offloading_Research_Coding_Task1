@@ -1,0 +1,488 @@
+# vLLM KV Cache Offloading Research Coding Task
+
+You are my **vLLM / KV Cache Offloading Research Coding Assistant**.
+
+I am doing research on KV cache management for LLM inference. The core idea is to study whether heterogeneous storage can help KV cache offloading:
+
+- fast tier: metadata / keys / indexes, possibly PM / fast SSD / fast NVMe
+- slow tier: large KV tensor payloads, possibly slower SSD / NVMe / ZNS SSD
+
+Do not implement the full SSD system immediately. The first goal is to modify vLLM carefully so that I can profile recomputation cost and KV cache offloading I/O characteristics.
+
+---
+
+## 1. Current environment
+
+Main workspace:
+
+```bash
+/home/jeff-wang/vllm_lab
+```
+
+Two important repositories:
+
+```bash
+/home/jeff-wang/vllm_lab/repos/vllm
+/home/jeff-wang/vllm_lab/repos/kv-cache-offload-lab
+```
+
+`vllm` is my vLLM fork. Real vLLM source-code changes should be made here:
+
+```bash
+/home/jeff-wang/vllm_lab/repos/vllm
+```
+
+Current branch:
+
+```text
+kv-offload-dev
+```
+
+`kv-cache-offload-lab` is my experiment-control repo. Put scripts, docs, configs, and trace-analysis tools here:
+
+```bash
+/home/jeff-wang/vllm_lab/repos/kv-cache-offload-lab
+```
+
+Do not commit models, environments, cache directories, logs, large runs, safetensors, checkpoints, or secrets.
+
+Environment:
+
+```text
+OS: Ubuntu 24.04
+GPU: 2 × RTX 4090
+Python env: /home/jeff-wang/vllm_lab/envs/vllm-dev
+Python: 3.12.13
+torch: 2.11.0+cu130
+CUDA / nvcc: installed inside the micromamba env
+vLLM: editable install from /home/jeff-wang/vllm_lab/repos/vllm
+```
+
+Activation script:
+
+```bash
+source /home/jeff-wang/vllm_lab/repos/kv-cache-offload-lab/scripts/local_4090/activate_vllm_dev.sh
+```
+
+---
+
+## 2. Research goals
+
+I need two things.
+
+### Goal A: Measure recomputation cost
+
+If some KV cache blocks are evicted, later they may need to be recomputed instead of reloaded from CPU memory or SSD.
+
+Please help me figure out:
+
+1. Where recomputation would happen in vLLM.
+2. Whether current vLLM already has recompute / preemption logic.
+3. Where to add timers.
+4. How to measure model-forward / prefix recomputation cost.
+5. How recomputation cost changes with context length, batch size, model, and output length.
+
+First version can be approximate. It is okay to measure controlled forward/recompute cost rather than implementing perfect recomputation immediately.
+
+### Goal B: Profile KV cache offloading I/O characteristics
+
+I need to understand the I/O behavior of KV cache blocks that would be evicted/offloaded:
+
+1. number of evicted/offloaded blocks
+2. block size in bytes
+3. estimated payload bytes
+4. request / sequence / block identity if available
+5. allocation/free/reuse timing
+6. reuse distance
+7. whether access pattern looks sequential or random
+8. whether metadata and tensor payload can be separated
+9. whether future SSD offloading should batch writes/reads
+
+For the first prototype, fake offloading to CPU memory is enough. It does not need to actually write to SSD yet.
+
+---
+
+## 3. Coding rules
+
+Please work conservatively.
+
+1. First inspect the source code.
+2. Do not assume exact file names.
+3. Use `rg`, `find`, and code reading.
+4. Do not change CUDA kernels in this stage.
+5. Prefer Python/system-level instrumentation first.
+6. Add all profiling behind environment variables.
+7. Default vLLM behavior must stay unchanged when profiling is disabled.
+8. Do not log prompts or generated text by default.
+9. Do not log actual huge tensors.
+10. Keep changes small and reviewable.
+
+---
+
+## 4. First step: inspect current repo state
+
+Run:
+
+```bash
+cd /home/jeff-wang/vllm_lab/repos/vllm
+git status
+git branch --show-current
+git rev-parse --short HEAD
+git remote -v
+```
+
+Then:
+
+```bash
+cd /home/jeff-wang/vllm_lab/repos/kv-cache-offload-lab
+git status
+find . -maxdepth 3 -type f | sort | head -100
+```
+
+Then:
+
+```bash
+source /home/jeff-wang/vllm_lab/repos/kv-cache-offload-lab/scripts/local_4090/activate_vllm_dev.sh
+
+python - <<'PY'
+import torch, vllm
+print("torch:", torch.__version__)
+print("torch cuda:", torch.version.cuda)
+print("cuda available:", torch.cuda.is_available())
+print("vllm:", vllm.__version__)
+print("vllm file:", vllm.__file__)
+PY
+
+which nvcc
+nvcc --version
+```
+
+If any of these fail, stop and explain before modifying code.
+
+---
+
+## 5. Source-code mapping task
+
+In the vLLM repo, search for the KV cache and scheduler paths:
+
+```bash
+cd /home/jeff-wang/vllm_lab/repos/vllm
+
+rg -n "KVCache|kv_cache|KV cache|block manager|BlockManager|BlockSpace|cache block|prefix cache|PrefixCache|swap|preempt|recompute|evict|free.*block|allocate.*block|gpu block|cpu block" vllm
+```
+
+Please identify:
+
+1. request lifecycle
+2. scheduler step
+3. KV block allocation
+4. KV block freeing
+5. prefix cache hit/miss path
+6. preemption / swap / recompute path if present
+7. model forward execution path
+8. safest functions for instrumentation
+
+Before modifying code, create this document:
+
+```bash
+/home/jeff-wang/vllm_lab/repos/kv-cache-offload-lab/docs/kv_offload_source_map.md
+```
+
+It should summarize the files, classes, functions, and safe hook points.
+
+---
+
+## 6. Profiling design
+
+Create:
+
+```bash
+/home/jeff-wang/vllm_lab/repos/kv-cache-offload-lab/docs/kv_offload_profiling_design.md
+```
+
+The design should include three modes.
+
+### Mode 1: metadata-only profiling
+
+No tensor copy. Only log events.
+
+```bash
+export VLLM_KV_OFFLOAD_PROFILE=1
+export VLLM_KV_OFFLOAD_MODE=metadata_only
+```
+
+Events should include as many of these fields as safely available:
+
+```text
+timestamp_ns
+event_type
+request_id
+sequence_id
+block_id / block_ids
+num_blocks
+num_tokens
+num_layers
+bytes_estimated
+reason
+source_file_or_component
+```
+
+### Mode 2: fake CPU offload
+
+```bash
+export VLLM_KV_OFFLOAD_PROFILE=1
+export VLLM_KV_OFFLOAD_MODE=cpu_fake
+```
+
+First version can just simulate the offload and record estimated bytes. If a safe tensor-copy point is found, optionally copy to CPU memory later. Do not break vLLM.
+
+### Mode 3: recompute profiling
+
+```bash
+export VLLM_KV_RECOMPUTE_PROFILE=1
+```
+
+Record recompute candidates and model-forward timings. If true recomputation is not easy, implement a controlled microbenchmark script to measure prefix recomputation cost.
+
+---
+
+## 7. Implement JSONL trace writer
+
+Implement a lightweight trace writer.
+
+Suggested environment variable:
+
+```bash
+export VLLM_KV_OFFLOAD_TRACE=/home/jeff-wang/vllm_lab/runs/kv_profile_trace.jsonl
+```
+
+Each event should be one JSON object per line.
+
+Example:
+
+```json
+{"ts_ns":123456789,"event_type":"kv_block_alloc","request_id":"abc","num_blocks":4,"bytes_estimated":8388608,"detail":{"reason":"new_request"}}
+```
+
+Requirements:
+
+1. near-zero overhead when disabled
+2. robust to missing fields
+3. creates parent directory if needed
+4. does not crash vLLM if logging fails
+5. does not log prompts or generated text
+6. does not log tensors
+7. line-buffered or regularly flushed
+
+---
+
+## 8. Minimal instrumentation hooks
+
+Add hooks for the first version if the relevant locations are found:
+
+```text
+engine_start
+request_arrive
+scheduler_step_start
+scheduler_step_end
+kv_block_alloc
+kv_block_free
+kv_block_reuse
+prefix_cache_hit
+prefix_cache_miss
+preempt
+swap_or_offload_candidate
+recompute_candidate
+model_forward_start
+model_forward_end
+engine_shutdown
+```
+
+If some events are not easy to detect, document why and leave TODOs.
+
+---
+
+## 9. Fake offload abstraction
+
+Create a small abstraction, for example:
+
+```text
+KVOffloadProfiler
+KVOffloadTraceWriter
+FakeKVOffloadStore
+```
+
+This should prepare for future heterogeneous storage design:
+
+```text
+fast_tier:
+  metadata / keys / index
+
+slow_tier:
+  large KV tensor payload
+```
+
+Trace fields should distinguish:
+
+```text
+metadata_bytes
+payload_bytes
+source_tier
+target_tier
+logical_block_id
+physical_offset_placeholder
+```
+
+For now, `physical_offset_placeholder` can be fake.
+
+---
+
+## 10. Recompute profiling script
+
+Create a script in the lab repo:
+
+```bash
+/home/jeff-wang/vllm_lab/repos/kv-cache-offload-lab/scripts/local_4090/profile_recompute_cost.py
+```
+
+It should run controlled prompts with different prefix lengths and output timing results.
+
+Default test lengths:
+
+```text
+512
+1024
+2048
+4096
+```
+
+Use conservative defaults:
+
+```text
+model: Qwen/Qwen3-1.7B or local small model
+CUDA_VISIBLE_DEVICES=0
+max_tokens=1
+temperature=0
+```
+
+Use a real Python file with:
+
+```python
+if __name__ == "__main__":
+    main()
+```
+
+Do not use `python - <<'PY'` for big vLLM tests because multiprocessing spawn can fail with stdin scripts.
+
+---
+
+## 11. Trace analysis script
+
+Create:
+
+```bash
+/home/jeff-wang/vllm_lab/repos/kv-cache-offload-lab/scripts/local_4090/analyze_kv_offload_trace.py
+```
+
+It should read the JSONL trace and print:
+
+```text
+number of requests
+event counts by type
+total estimated KV bytes allocated
+total estimated KV bytes freed
+total estimated offload-candidate bytes
+average blocks per event
+estimated block size
+reuse distance if possible
+timeline summary
+```
+
+Prefer Python standard library first. Do not require heavy dependencies unless necessary.
+
+---
+
+## 12. Smoke test script
+
+Create:
+
+```bash
+/home/jeff-wang/vllm_lab/repos/kv-cache-offload-lab/scripts/local_4090/run_kv_profile_smoke.sh
+```
+
+It should roughly do:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+source /home/jeff-wang/vllm_lab/repos/kv-cache-offload-lab/scripts/local_4090/activate_vllm_dev.sh
+
+export VLLM_KV_OFFLOAD_PROFILE=1
+export VLLM_KV_OFFLOAD_MODE=metadata_only
+export VLLM_KV_RECOMPUTE_PROFILE=1
+export VLLM_KV_OFFLOAD_TRACE=/home/jeff-wang/vllm_lab/runs/kv_profile_smoke/trace.jsonl
+
+mkdir -p /home/jeff-wang/vllm_lab/runs/kv_profile_smoke
+
+CUDA_VISIBLE_DEVICES=0 python /home/jeff-wang/vllm_lab/repos/kv-cache-offload-lab/scripts/local_4090/profile_recompute_cost.py \
+  --model Qwen/Qwen3-1.7B \
+  --max-model-len 2048 \
+  --lengths 512 1024 \
+  --max-tokens 1
+
+python /home/jeff-wang/vllm_lab/repos/kv-cache-offload-lab/scripts/local_4090/analyze_kv_offload_trace.py \
+  --trace /home/jeff-wang/vllm_lab/runs/kv_profile_smoke/trace.jsonl
+```
+
+If the model is not available locally or requires internet, explain and make the script accept a local model path.
+
+---
+
+## 13. Final report format
+
+When finished, report:
+
+```text
+1. files inspected
+2. files modified
+3. docs created
+4. scripts created
+5. new environment variables
+6. how to enable profiling
+7. how to disable profiling
+8. smoke-test command
+9. what works now
+10. what remains TODO
+11. risks / overhead
+12. recommended next step
+```
+
+Also show:
+
+```bash
+git diff --stat
+git diff --name-only
+```
+
+Do not commit automatically unless I explicitly ask.
+
+---
+
+## 14. Main principle
+
+The first milestone is not to build the final SSD offloading system.
+
+The first milestone is to make vLLM observable:
+
+```text
+request lifecycle
+scheduler behavior
+KV block allocation/free/reuse
+offload candidates
+recompute candidates
+estimated KV payload size
+model forward/recompute timing
+```
+
+Only after this profiling layer works should we design the real CPU / SSD / heterogeneous storage offloading policy.
